@@ -12,6 +12,7 @@ from .streams import EyeStream, TrackingStream, StreamStatus, tracker_to_osc_ind
 from ..vrc_config.parser import load_avatar_schema
 from ..vrc_config.resolver import resolve_avatar_config_path_for_avatar_id
 from ..vrc_config.schema import AvatarSchema, ParameterType
+from ..oscquery.client import OscQueryClient, OscQueryParameter
 
 
 def _clamp_axis(v: float) -> tuple[float, bool]:
@@ -153,10 +154,12 @@ class VRChatDomainAdapter:
         schema: AvatarSchema | None = None,
         schema_source: str | None = None,
         schema_path: str | None = None,
+        oscquery_client: OscQueryClient | None = None,
     ) -> None:
         self._transport = transport
         self._settings = settings
         self._logger = logger
+        self._oscquery = oscquery_client
         self._schema_state = _SchemaState.initial(
             schema=schema,
             schema_source=schema_source,
@@ -297,6 +300,7 @@ class VRChatDomainAdapter:
 
         return {
             "osc_enabled_detected": osc_enabled_detected,
+            "oscquery_available": self._oscquery is not None,
             "target_host": self._settings.osc.send.ip,
             "target_port": self._settings.osc.send.port,
             "last_send_ms_ago": self._transport.last_sent_ms_ago(),
@@ -351,27 +355,94 @@ class VRChatDomainAdapter:
     # Avatar domain
     # -----------------
 
-    def avatar_list_parameters(self) -> dict[str, Any]:
+    async def avatar_list_parameters(self) -> dict[str, Any]:
+        # Prefer OSCQuery: returns live values + types without needing VRChat OSC output.
+        if self._oscquery is not None:
+            oq_params = await self._oscquery.get_avatar_parameters()
+            if oq_params:
+                params = [
+                    {
+                        "name": p.path.removeprefix("/avatar/parameters/"),
+                        "path": p.path,
+                        "osc_type": p.type,
+                        "value": p.value,
+                        "access": p.access,
+                        "source": "oscquery",
+                    }
+                    for p in oq_params
+                ]
+                params.sort(key=lambda x: x["name"])
+                return {"parameters": params, "source": "oscquery"}
+
+        # Fallback: local OSC schema file (no live values).
         schema = self._schema_snapshot().schema
         if schema is None:
-            return {"parameters": []}
+            return {"parameters": [], "source": "none"}
 
-        params: list[dict[str, Any]] = []
-        for p in schema.parameters.values():
-            params.append(
-                {
-                    "name": p.name,
-                    "type": p.type,
-                    # These fields are not available from LocalLow schema today.
-                    "default": None,
-                    "min": None,
-                    "max": None,
-                    "is_network_synced": None,
-                }
-            )
-
+        params = [
+            {
+                "name": p.name,
+                "path": f"/avatar/parameters/{p.name}",
+                "osc_type": None,
+                "value": None,
+                "access": None,
+                "source": "local_schema",
+            }
+            for p in schema.parameters.values()
+        ]
         params.sort(key=lambda x: x["name"])
-        return {"parameters": params}
+        return {"parameters": params, "source": "local_schema"}
+
+    async def avatar_get_id(self) -> dict[str, Any]:
+        """Return the current avatar ID via OSCQuery or cached observer."""
+        avatar_id: str | None = None
+        source = "none"
+
+        if self._oscquery is not None:
+            avatar_id = await self._oscquery.get_avatar_id()
+            if avatar_id:
+                source = "oscquery"
+
+        if not avatar_id:
+            avatar_id = self._schema_snapshot().observed_avatar_id
+            if avatar_id:
+                source = "osc_receiver"
+
+        return {"avatar_id": avatar_id, "source": source}
+
+    async def avatar_get_parameter(self, *, name: str) -> dict[str, Any]:
+        """Return a single parameter's live value from OSCQuery."""
+        if self._oscquery is None:
+            raise DomainError(
+                code="CAPABILITY_UNAVAILABLE",
+                message="OSCQuery not available; cannot read live parameter values.",
+            )
+        param = await self._oscquery.get_parameter(name)
+        if param is None:
+            raise DomainError(
+                code="NOT_FOUND",
+                message=f"Parameter {name!r} not found in OSCQuery tree. "
+                        "Check name spelling or call vrc_avatar_list_parameters first.",
+                details={"name": name},
+            )
+        return {
+            "name": name,
+            "path": param.path,
+            "osc_type": param.type,
+            "value": param.value,
+            "access": param.access,
+        }
+
+    async def avatar_change(self, *, avatar_id: str, trace_id: str) -> dict[str, Any]:
+        """Switch avatar by sending to /avatar/change."""
+        avatar_id = (avatar_id or "").strip()
+        if not avatar_id:
+            raise DomainError(code="INVALID_ARGUMENT", message="avatar_id must be non-empty.")
+        await self._transport.send(address="/avatar/change", value=avatar_id, trace_id=trace_id)
+        # Invalidate OSCQuery port cache — new avatar may reload OSCQuery state.
+        if self._oscquery is not None:
+            self._oscquery.invalidate()
+        return {"avatar_id": avatar_id, "osc_address": "/avatar/change"}
 
     async def avatar_set_parameter(
         self,

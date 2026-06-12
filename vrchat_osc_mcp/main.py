@@ -13,6 +13,7 @@ from .osc.receiver import OSCReceiver
 from .domain.adapter import VRChatDomainAdapter
 from .vrc_config.parser import load_avatar_schema
 from .vrc_config.resolver import resolve_avatar_config_path
+from .oscquery.client import OscQueryClient
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -148,6 +149,9 @@ async def _run(settings) -> None:
     )
     await osc.start()
 
+    oscquery = OscQueryClient()
+    await oscquery.start()
+
     adapter = VRChatDomainAdapter(
         transport=osc,
         settings=settings,
@@ -155,6 +159,7 @@ async def _run(settings) -> None:
         schema=schema,
         schema_source=schema_source,
         schema_path=schema_path_str,
+        oscquery_client=oscquery,
     )
 
     mcp = create_server(adapter=adapter)
@@ -207,6 +212,7 @@ async def _run(settings) -> None:
     finally:
         if receiver is not None:
             await receiver.close()
+        await oscquery.stop()
         await osc.close()
 
 

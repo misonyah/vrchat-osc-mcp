@@ -27,9 +27,12 @@ VRC_V1_TOOL_NAMES: tuple[str, ...] = (
     "vrc_input_release_buttons",
     "vrc_input_stop",
     # Avatar
+    "vrc_avatar_get_id",
     "vrc_avatar_list_parameters",
+    "vrc_avatar_get_parameter",
     "vrc_avatar_set_parameter",
     "vrc_avatar_set_parameters",
+    "vrc_avatar_change",
     # Tracking
     "vrc_tracking_set_tracker_pose",
     "vrc_tracking_set_head_reference",
@@ -407,14 +410,76 @@ def create_server(*, adapter) -> FastMCP:
     @_tool(
         name="vrc_avatar_list_parameters",
         description=(
-            "List current Avatar parameters (from local OSC config/schema; may be empty if not loaded)."
+            "List current Avatar parameters with live values (via OSCQuery if available, "
+            "otherwise falls back to local OSC config/schema). "
+            "Each entry includes name, path, osc_type, value, access, and source."
         ),
         annotations={"readOnlyHint": True},
         output_schema=_ENVELOPE_OUTPUT_SCHEMA,
     )
-    def vrc_avatar_list_parameters() -> dict:
-        """List the current avatar's parameters (returns empty if schema is not loaded)."""
-        return _wrap_sync(lambda *, trace_id: adapter.avatar_list_parameters())()
+    async def vrc_avatar_list_parameters(ctx: Context | None = None) -> dict:
+        """List the current avatar's parameters with live values where possible."""
+        return await _wrap_async(lambda *, trace_id: adapter.avatar_list_parameters())(ctx=ctx)
+
+    @_tool(
+        name="vrc_avatar_get_id",
+        description=(
+            "Get the current avatar's ID (e.g. avtr_xxxx-...). "
+            "Uses OSCQuery for an instant live read; falls back to the last /avatar/change broadcast."
+        ),
+        annotations={"readOnlyHint": True},
+        output_schema=_ENVELOPE_OUTPUT_SCHEMA,
+    )
+    async def vrc_avatar_get_id(ctx: Context | None = None) -> dict:
+        """Get the current avatar ID."""
+        return await _wrap_async(lambda *, trace_id: adapter.avatar_get_id())(ctx=ctx)
+
+    @_tool(
+        name="vrc_avatar_get_parameter",
+        description=(
+            "Get the live value of a single avatar parameter by name (via OSCQuery). "
+            "Returns current value, OSC type, and read/write access. "
+            "Requires VRChat to be running with OSC enabled."
+        ),
+        annotations={"readOnlyHint": True},
+        output_schema=_ENVELOPE_OUTPUT_SCHEMA,
+    )
+    async def vrc_avatar_get_parameter(
+        name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Short parameter name as it appears in the avatar (e.g. 'IsLocal', 'GestureLeft'). "
+                    "Call vrc_avatar_list_parameters first to discover valid names."
+                ),
+                min_length=1,
+            ),
+        ],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Get a single avatar parameter's live value."""
+        return await _wrap_async(adapter.avatar_get_parameter)(name=name, ctx=ctx)
+
+    @_tool(
+        name="vrc_avatar_change",
+        description=(
+            "Switch to a different avatar by ID (e.g. 'avtr_xxxx-...'). "
+            "Sends /avatar/change via OSC. VRChat must be running with OSC enabled."
+        ),
+        output_schema=_ENVELOPE_OUTPUT_SCHEMA,
+    )
+    async def vrc_avatar_change(
+        avatar_id: Annotated[
+            str,
+            Field(
+                description="Avatar ID to switch to (format: avtr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).",
+                min_length=1,
+            ),
+        ],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Switch avatar."""
+        return await _wrap_async(adapter.avatar_change)(avatar_id=avatar_id, ctx=ctx)
 
     @_tool(
         name="vrc_avatar_set_parameter",
