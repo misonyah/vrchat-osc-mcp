@@ -171,7 +171,7 @@ class OscQueryClient:
         try:
             vrchat_pid: int | None = None
             for proc in psutil.process_iter(["name", "pid"]):
-                if (proc.info.get("name") or "").lower().startswith("vrchat"):
+                if (proc.info.get("name") or "").lower() == "vrchat.exe":
                     vrchat_pid = proc.info["pid"]
                     break
 

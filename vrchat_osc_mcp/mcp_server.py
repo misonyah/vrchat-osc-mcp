@@ -133,6 +133,7 @@ def create_server(*, adapter) -> FastMCP:
                 "type": ["object", "null"],
                 "properties": {
                     "osc_enabled_detected": {"type": "boolean"},
+                    "oscquery_available": {"type": "boolean"},
                     "target_host": {"type": ["string", "null"]},
                     "target_port": {"type": ["integer", "null"]},
                     "last_send_ms_ago": {"type": ["integer", "null"]},
