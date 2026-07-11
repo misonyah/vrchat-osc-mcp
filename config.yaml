@@ -44,6 +44,9 @@ safety:
   parameter_policy: allowlist  # strict | allowlist | permissive
   allowed_parameters: []
 
+  # 若 VRChat.exe 持续这么多分钟未运行，服务会自动退出（释放端口/停止后台开销）。0 = 禁用。
+  vrchat_idle_shutdown_minutes: 60
+
 profiles:
   directory: profiles
   active: default

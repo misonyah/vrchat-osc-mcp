@@ -87,6 +87,11 @@ class SafetySettings(BaseModel):
     parameter_policy: Literal["strict", "allowlist", "permissive"] = "allowlist"
     allowed_parameters: list[str] = Field(default_factory=list)
 
+    # Auto-shutdown: exit gracefully once VRChat.exe hasn't been seen running
+    # for this many minutes (frees OSC ports / stops background CPU use from
+    # an unattended server). 0 disables auto-shutdown.
+    vrchat_idle_shutdown_minutes: int = Field(60, ge=0, le=1440)
+
 
 class ProfilesSettings(BaseModel):
     directory: Path = Path("profiles")

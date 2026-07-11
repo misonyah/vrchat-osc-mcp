@@ -9,16 +9,23 @@ Discovery strategy (in order):
 1. psutil process lookup (Windows / all platforms) — finds VRChat's PID,
    gets its listening TCP ports, probes each with a quick HTTP check.
    ~200 ms on a loaded system.
-2. mDNS fallback via zeroconf — waits up to `mdns_timeout_s` for VRChat to
-   announce its _oscjson._tcp service.  Slower (~1-3 s) but cross-platform.
+2. mDNS fallback via zeroconf — briefly browses for VRChat's _oscjson._tcp
+   announcement, bounded by `mdns_timeout_s`. The zeroconf listener is only
+   alive for that window, not for the life of the process: leaving it
+   running continuously means parsing every local mDNS/Bonjour packet on
+   the LAN indefinitely, which is a real (if quiet) background CPU cost
+   that shows up even when VRChat was never started.
 
-The discovered port is cached.  Call `invalidate()` to force re-discovery
-(e.g. after VRChat restarts).
+A failed discovery attempt (including a failed mDNS browse) is cached for
+`mdns_negative_cache_s` so repeated status polls don't re-trigger a zeroconf
+browse every call. The discovered port itself is cached until `invalidate()`
+is called (e.g. after VRChat restarts).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,60 +43,37 @@ class OscQueryParameter:
 
 
 class OscQueryClient:
-    def __init__(self, *, logger_=None, mdns_timeout_s: float = 3.0) -> None:
+    def __init__(
+        self,
+        *,
+        logger_=None,
+        mdns_timeout_s: float = 3.0,
+        mdns_negative_cache_s: float = 20.0,
+    ) -> None:
         self._log = logger_ or logger
         self._mdns_timeout_s = mdns_timeout_s
+        self._mdns_negative_cache_s = mdns_negative_cache_s
         self._port: int | None = None
-        self._zc = None        # AsyncZeroconf instance
-        self._browser = None   # AsyncServiceBrowser
-        self._mdns_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._mdns_last_failed_at: float | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start background mDNS browsing."""
-        try:
-            from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
-            from zeroconf import ServiceStateChange
+        """No persistent background work to start.
 
-            self._zc = AsyncZeroconf()
-            mdns_queue = self._mdns_queue
-
-            async def _handler(zeroconf, service_type, name, state_change):
-                if state_change is ServiceStateChange.Added:
-                    info = await zeroconf.async_get_service_info(service_type, name)
-                    if info and info.parsed_addresses():
-                        port = info.port
-                        addr = info.parsed_addresses()[0]
-                        if await self._is_vrchat(addr, port):
-                            self._log.info("oscquery.mdns_found", extra={"addr": addr, "port": port})
-                            self._port = port
-                            await mdns_queue.put(port)
-
-            self._browser = AsyncServiceBrowser(
-                self._zc.zeroconf, ["_oscjson._tcp.local."], handlers=[_handler]
-            )
-            self._log.info("oscquery.mdns_browser_started")
-        except ImportError:
-            self._log.warning("oscquery.zeroconf_unavailable: mDNS fallback disabled (pip install zeroconf)")
-        except Exception as exc:
-            self._log.warning("oscquery.mdns_start_failed", extra={"error": str(exc)})
+        mDNS discovery is performed lazily and only for a bounded window
+        (see `_wait_mdns`) instead of running for the process lifetime.
+        """
+        return
 
     async def stop(self) -> None:
-        """Stop background mDNS browsing."""
-        try:
-            if self._browser is not None:
-                await self._browser.async_cancel()
-            if self._zc is not None:
-                await self._zc.async_close()
-        except Exception:
-            pass
-        self._browser = None
-        self._zc = None
+        """No persistent background work to stop (kept for API compatibility)."""
+        return
 
     def invalidate(self) -> None:
         """Force re-discovery on next call (e.g. after VRChat restarts)."""
         self._port = None
+        self._mdns_last_failed_at = None
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -154,11 +138,24 @@ class OscQueryClient:
         port = await self._find_via_process()
         if port is not None:
             self._port = port
+            self._mdns_last_failed_at = None
             return port
+
+        # Avoid spinning up a zeroconf browse on every single call while
+        # VRChat isn't running (e.g. repeated status polls) — that's exactly
+        # the kind of always-on background cost we're trying to avoid.
+        if (
+            self._mdns_last_failed_at is not None
+            and (time.monotonic() - self._mdns_last_failed_at) < self._mdns_negative_cache_s
+        ):
+            return None
 
         port = await self._wait_mdns(timeout=self._mdns_timeout_s)
         if port is not None:
             self._port = port
+            self._mdns_last_failed_at = None
+        else:
+            self._mdns_last_failed_at = time.monotonic()
         return port
 
     async def _find_via_process(self) -> int | None:
@@ -197,13 +194,48 @@ class OscQueryClient:
         return None
 
     async def _wait_mdns(self, timeout: float) -> int | None:
-        """Wait up to `timeout` seconds for an mDNS-discovered port."""
-        if self._zc is None:
-            return None
+        """Briefly browse mDNS for VRChat's _oscjson._tcp announcement.
+
+        The zeroconf listener (and its background thread) only lives for the
+        duration of this call, bounded by `timeout` — it is not kept running
+        between calls.
+        """
         try:
-            return await asyncio.wait_for(self._mdns_queue.get(), timeout=timeout)
+            from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
+            from zeroconf import ServiceStateChange
+        except ImportError:
+            self._log.warning("oscquery.zeroconf_unavailable: mDNS fallback disabled (pip install zeroconf)")
+            return None
+
+        found: asyncio.Queue[int] = asyncio.Queue()
+
+        async def _handler(zeroconf, service_type, name, state_change):
+            if state_change is ServiceStateChange.Added:
+                info = await zeroconf.async_get_service_info(service_type, name)
+                if info and info.parsed_addresses():
+                    port = info.port
+                    addr = info.parsed_addresses()[0]
+                    if await self._is_vrchat(addr, port):
+                        self._log.info("oscquery.mdns_found", extra={"addr": addr, "port": port})
+                        await found.put(port)
+
+        zc = AsyncZeroconf()
+        browser = None
+        try:
+            browser = AsyncServiceBrowser(zc.zeroconf, ["_oscjson._tcp.local."], handlers=[_handler])
+            return await asyncio.wait_for(found.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+        except Exception as exc:
+            self._log.warning("oscquery.mdns_browse_failed", extra={"error": str(exc)})
+            return None
+        finally:
+            try:
+                if browser is not None:
+                    await browser.async_cancel()
+                await zc.async_close()
+            except Exception:
+                pass
 
     async def _is_vrchat(self, addr: str, port: int) -> bool:
         """Return True if the HTTP server at addr:port is VRChat OSCQuery."""

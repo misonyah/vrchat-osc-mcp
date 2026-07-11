@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from .domain.adapter import VRChatDomainAdapter
 from .vrc_config.parser import load_avatar_schema
 from .vrc_config.resolver import resolve_avatar_config_path
 from .oscquery.client import OscQueryClient
+from .singleton import InstanceAlreadyRunningError, SingleInstanceLock
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -111,6 +114,40 @@ def _cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return o
 
 
+def _vrchat_is_running() -> bool:
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        return any(
+            (proc.info.get("name") or "").lower() == "vrchat.exe"
+            for proc in psutil.process_iter(["name"])
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _vrchat_idle_watchdog(*, idle_timeout_s: float, poll_interval_s: float, logger) -> None:
+    """Return once VRChat.exe hasn't been seen running for idle_timeout_s.
+
+    Runs alongside the MCP server so an unattended instance doesn't sit
+    around indefinitely (and doing the psutil check is far cheaper than the
+    OSCQuery discovery path, so this alone doesn't add to background CPU use).
+    """
+    last_seen = time.monotonic()
+    while True:
+        await asyncio.sleep(poll_interval_s)
+        now = time.monotonic()
+        if _vrchat_is_running():
+            last_seen = now
+            continue
+        idle_s = now - last_seen
+        if idle_s >= idle_timeout_s:
+            logger.warning("watchdog.vrchat_idle_shutdown", idle_s=int(idle_s))
+            return
+
+
 async def _run(settings) -> None:
     configure_logging(level=settings.logging.level, json_logs=settings.logging.json_logs)
     logger = get_logger().bind(component="app")
@@ -197,7 +234,7 @@ async def _run(settings) -> None:
         http_path=settings.mcp.http.path,
     )
 
-    try:
+    async def _serve() -> None:
         if settings.mcp.transport == "stdio":
             await mcp.run_async(transport="stdio")
         elif settings.mcp.transport == "sse":
@@ -209,6 +246,38 @@ async def _run(settings) -> None:
                 port=settings.mcp.http.port,
                 path=settings.mcp.http.path,
             )
+
+    server_task = asyncio.create_task(_serve(), name="mcp-serve")
+    tasks: list[asyncio.Task[None]] = [server_task]
+
+    idle_minutes = settings.safety.vrchat_idle_shutdown_minutes
+    watchdog_task: asyncio.Task[None] | None = None
+    if idle_minutes > 0:
+        watchdog_task = asyncio.create_task(
+            _vrchat_idle_watchdog(
+                idle_timeout_s=idle_minutes * 60.0,
+                poll_interval_s=60.0,
+                logger=get_logger().bind(component="watchdog"),
+            ),
+            name="vrchat-idle-watchdog",
+        )
+        tasks.append(watchdog_task)
+
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        if watchdog_task is not None and watchdog_task in done:
+            logger.info("server.stop", reason="vrchat_idle_timeout", idle_minutes=idle_minutes)
+        elif server_task in done:
+            exc = server_task.exception()
+            if exc is not None:
+                raise exc
     finally:
         if receiver is not None:
             await receiver.close()
@@ -223,5 +292,15 @@ def main(argv: list[str] | None = None) -> int:
     project_root = Path(__file__).resolve().parents[1]
     loaded = load_settings(project_root=project_root, config_path=args.config, cli_overrides=_cli_overrides(args))
 
-    asyncio.run(_run(loaded.settings))
+    lock = SingleInstanceLock()
+    try:
+        lock.acquire()
+    except InstanceAlreadyRunningError as e:
+        print(f"[vrchat-osc-mcp] {e}", file=sys.stderr)
+        return 1
+
+    try:
+        asyncio.run(_run(loaded.settings))
+    finally:
+        lock.release()
     return 0
