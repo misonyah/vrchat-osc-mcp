@@ -1,10 +1,12 @@
 import asyncio
 import inspect
 import re
+import time
 import uuid
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 from pydantic import Field
 
 from .domain.errors import DomainError
@@ -58,12 +60,36 @@ VRC_V1_TOOL_NAMES: tuple[str, ...] = (
 )
 
 
-def create_server(*, adapter) -> FastMCP:
+class ActivityTracker:
+    """Monotonic timestamp of the last MCP message seen, for idle detection."""
+
+    def __init__(self) -> None:
+        self.last_activity_monotonic: float = time.monotonic()
+
+    def touch(self) -> None:
+        self.last_activity_monotonic = time.monotonic()
+
+
+class _ActivityMiddleware(Middleware):
+    """Touches an ActivityTracker on every request/notification, regardless of method."""
+
+    def __init__(self, tracker: ActivityTracker) -> None:
+        self._tracker = tracker
+
+    async def on_message(self, context: MiddlewareContext[Any], call_next):
+        self._tracker.touch()
+        return await call_next(context)
+
+
+def create_server(*, adapter) -> tuple[FastMCP, ActivityTracker]:
     mcp = FastMCP(
         name="vrchat-osc-mcp",
         # Avoid leaking internals by default; our DomainError payload is explicit anyway.
         mask_error_details=True,
     )
+
+    activity = ActivityTracker()
+    mcp.add_middleware(_ActivityMiddleware(activity))
 
     logger = get_logger().bind(component="mcp")
 
@@ -1046,4 +1072,4 @@ def create_server(*, adapter) -> FastMCP:
         # Per PLAN: macro_stop calls stop_all directly
         return await _wrap_async(adapter.stop_all)(ctx=ctx)
 
-    return mcp
+    return mcp, activity

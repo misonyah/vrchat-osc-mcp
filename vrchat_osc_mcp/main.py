@@ -148,6 +148,24 @@ async def _vrchat_idle_watchdog(*, idle_timeout_s: float, poll_interval_s: float
             return
 
 
+async def _mcp_idle_watchdog(*, activity, idle_timeout_s: float, poll_interval_s: float, logger) -> None:
+    """Return once no MCP request/notification has been seen for idle_timeout_s.
+
+    Safety net independent of the stdio transport's own EOF detection: a
+    disconnected client should make the stdio read loop end server_task on
+    its own, but a multi-layer process supervisor (e.g. `uv run` wrapping a
+    venv console script) does not always propagate that promptly on Windows,
+    which can otherwise leave this process (and any running tracking/eye
+    streams) running indefinitely with no client attached.
+    """
+    while True:
+        await asyncio.sleep(poll_interval_s)
+        idle_s = time.monotonic() - activity.last_activity_monotonic
+        if idle_s >= idle_timeout_s:
+            logger.warning("watchdog.mcp_idle_shutdown", idle_s=int(idle_s))
+            return
+
+
 async def _run(settings) -> None:
     configure_logging(level=settings.logging.level, json_logs=settings.logging.json_logs)
     logger = get_logger().bind(component="app")
@@ -199,7 +217,7 @@ async def _run(settings) -> None:
         oscquery_client=oscquery,
     )
 
-    mcp = create_server(adapter=adapter)
+    mcp, mcp_activity = create_server(adapter=adapter)
 
     receiver: OSCReceiver | None = None
     if settings.osc.receive.enabled:
@@ -263,6 +281,20 @@ async def _run(settings) -> None:
         )
         tasks.append(watchdog_task)
 
+    mcp_idle_minutes = settings.safety.mcp_idle_shutdown_minutes
+    mcp_watchdog_task: asyncio.Task[None] | None = None
+    if mcp_idle_minutes > 0:
+        mcp_watchdog_task = asyncio.create_task(
+            _mcp_idle_watchdog(
+                activity=mcp_activity,
+                idle_timeout_s=mcp_idle_minutes * 60.0,
+                poll_interval_s=60.0,
+                logger=get_logger().bind(component="watchdog"),
+            ),
+            name="mcp-idle-watchdog",
+        )
+        tasks.append(mcp_watchdog_task)
+
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
@@ -274,11 +306,21 @@ async def _run(settings) -> None:
 
         if watchdog_task is not None and watchdog_task in done:
             logger.info("server.stop", reason="vrchat_idle_timeout", idle_minutes=idle_minutes)
+        elif mcp_watchdog_task is not None and mcp_watchdog_task in done:
+            logger.info("server.stop", reason="mcp_idle_timeout", idle_minutes=mcp_idle_minutes)
         elif server_task in done:
             exc = server_task.exception()
             if exc is not None:
                 raise exc
     finally:
+        # Best-effort: stop any running background streams (tracking/eye) and
+        # release held buttons/typing before tearing down transports, so a
+        # server shutdown for any reason (client disconnect, either idle
+        # watchdog) doesn't leave them orphaned mid-loop.
+        try:
+            await adapter.stop_all(trace_id="server_shutdown")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("shutdown.stop_all_failed", error=str(e))
         if receiver is not None:
             await receiver.close()
         await oscquery.stop()

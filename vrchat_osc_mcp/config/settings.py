@@ -92,6 +92,16 @@ class SafetySettings(BaseModel):
     # an unattended server). 0 disables auto-shutdown.
     vrchat_idle_shutdown_minutes: int = Field(60, ge=0, le=1440)
 
+    # Auto-shutdown: exit gracefully once no MCP request/notification has been
+    # received for this many minutes. This is a safety net independent of the
+    # stdio transport's own EOF detection: a disconnected client should make
+    # the stdio read loop end on its own, but a multi-layer process
+    # supervisor (e.g. `uv run` wrapping a venv console script) does not
+    # always propagate that promptly, which can otherwise leave the process
+    # (and any running tracking/eye streams) running indefinitely.
+    # 0 disables this watchdog.
+    mcp_idle_shutdown_minutes: int = Field(60, ge=0, le=1440)
+
 
 class ProfilesSettings(BaseModel):
     directory: Path = Path("profiles")

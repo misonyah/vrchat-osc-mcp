@@ -17,4 +17,6 @@ def test_create_server_registers_without_error() -> None:
     class _DummyAdapter:  # noqa: D401
         """Minimal adapter stub for server construction."""
 
-    create_server(adapter=_DummyAdapter())
+    mcp, activity = create_server(adapter=_DummyAdapter())
+    assert mcp is not None
+    assert activity is not None
